@@ -1,9 +1,11 @@
-FROM apify/actor-node-playwright-chrome:22
+FROM apify/actor-node:22
 
-COPY --chown=myuser:myuser package*.json Dockerfile ./
+COPY --chown=myuser:myuser package*.json ./
 
 RUN npm --quiet set progress=false \
-    && npm install --omit=dev --omit=optional \
+    && npm install --omit=dev \
+    && node -e "import('impit').then(m => console.log('impit OK:', Object.keys(m)))" \
+    && (npm list --omit=dev --all || true) \
     && rm -r ~/.npm
 
 COPY --chown=myuser:myuser . ./

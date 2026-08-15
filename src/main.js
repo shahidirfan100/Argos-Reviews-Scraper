@@ -1,8 +1,8 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { Dataset, PlaywrightCrawler } from 'crawlee';
-import { chromium } from 'patchright';
+import { Dataset } from 'crawlee';
+import { Impit } from 'impit';
 
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 2;
@@ -11,19 +11,7 @@ const MAX_PRODUCTS = 50;
 const FETCH_TIMEOUT_MS = 15_000;
 const API_MAX_RETRIES = 3;
 const API_RETRY_BASE_DELAY_MS = 500;
-
-const VIEWPORTS = [
-    { width: 1920, height: 1080 },
-    { width: 1536, height: 864 },
-    { width: 1440, height: 900 },
-    { width: 1366, height: 768 },
-    { width: 1280, height: 720 },
-    { width: 2560, height: 1440 },
-];
-
-function pickRandom(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
-}
+const API_BASE_URL = 'https://www.argos.co.uk';
 
 function toPositiveInteger(value, fallback) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -117,31 +105,6 @@ function extractPartNumber(inputValue) {
 
 function normalizeProductUrl(partNumber) {
     return `https://www.argos.co.uk/product/${partNumber}`;
-}
-
-async function dismissCookieBanner(page) {
-    const selectors = [
-        { role: 'button', name: 'Required only' },
-        { role: 'button', name: 'Accept all' },
-        { role: 'button', name: 'Accept All' },
-        { role: 'button', name: 'Reject all' },
-        { role: 'button', name: 'Reject All' },
-        { role: 'button', name: 'Continue' },
-    ];
-
-    for (const { role, name } of selectors) {
-        try {
-            const button = page.getByRole(role, { name });
-            if (await button.isVisible({ timeout: 1_000 })) {
-                await button.click();
-                return true;
-            }
-        } catch {
-            // Try next selector.
-        }
-    }
-
-    return false;
 }
 
 function normalizeSort(sortBy) {
@@ -332,160 +295,157 @@ function mapReview(review, includesProducts, productContext, pageNumber, sortBy)
     });
 }
 
-async function fetchProductAndReviewsInBrowser(page, { partNumber, resultsWanted, maxPages, sortBy }) {
-    return page.evaluate(
-        async (params) => {
-            const {
-                partNumber: pagePartNumber,
-                resultsWanted: pageResultsWanted,
-                maxPages: pageMaxPages,
-                sortBy: pageSortBy,
-                fetchTimeoutMs,
-                apiMaxRetries,
-                apiRetryBaseDelayMs,
-            } = params;
+function delay(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
 
-            const delay = (ms) => new Promise((resolve) => {
-                setTimeout(resolve, ms);
-            });
+function isTransientError(error) {
+    return (
+        error?.name === 'AbortError' ||
+        error?.code === 'ETIMEDOUT' ||
+        error?.retryable === true ||
+        /fetch|network|timeout|temporar|timed out/i.test(String(error?.message || error))
+    );
+}
 
-            const isTransientError = (error) =>
-                error?.name === 'AbortError' ||
-                error?.retryable === true ||
-                /fetch|network|timeout|temporar/i.test(String(error?.message || error));
+function getRetryDelay(attempt, retryAfterHeader) {
+    const retryAfterSeconds = Number.parseFloat(retryAfterHeader || '');
+    const retryAfterMs = Number.isFinite(retryAfterSeconds)
+        ? Math.min(5_000, Math.max(0, retryAfterSeconds * 1_000))
+        : 0;
+    const exponentialDelay = Math.min(5_000, API_RETRY_BASE_DELAY_MS * 2 ** attempt);
+    return Math.max(retryAfterMs, exponentialDelay + Math.random() * 250);
+}
 
-            const getRetryDelay = (attempt, retryAfterHeader) => {
-                const retryAfterSeconds = Number.parseFloat(retryAfterHeader || '');
-                const retryAfterMs = Number.isFinite(retryAfterSeconds)
-                    ? Math.min(5_000, Math.max(0, retryAfterSeconds * 1_000))
-                    : 0;
-                const exponentialDelay = Math.min(5_000, apiRetryBaseDelayMs * 2 ** attempt);
-                return Math.max(retryAfterMs, exponentialDelay + Math.random() * 250);
-            };
+function isRetryableStatus(status) {
+    return status === 403 || status === 429 || status >= 500;
+}
 
-            const fetchJson = async (url) => {
-                for (let attempt = 0; attempt <= apiMaxRetries; attempt++) {
-                    const controller = new AbortController();
-                    const timer = setTimeout(() => controller.abort(), fetchTimeoutMs);
+async function fetchApiJson(client, url, referer) {
+    for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt++) {
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            let response;
 
-                    try {
-                        const response = await fetch(url, {
-                            credentials: 'include',
-                            signal: controller.signal,
-                        });
-
-                        if (!response.ok) {
-                            const isRetryableStatus = response.status === 429 || response.status >= 500;
-                            if (!isRetryableStatus || attempt === apiMaxRetries) {
-                                throw new Error(`Request failed ${response.status} for ${url}`);
-                            }
-
-                            await delay(getRetryDelay(attempt, response.headers.get('retry-after')));
-                            continue;
-                        }
-
-                        const text = await response.text();
-                        let json;
-
-                        try {
-                            json = JSON.parse(text);
-                        } catch {
-                            const parseError = new Error(`Invalid JSON from ${url}`);
-                            parseError.retryable = true;
-                            throw parseError;
-                        }
-
-                        if (!json || typeof json !== 'object' || Array.isArray(json)) {
-                            const shapeError = new Error(`Unexpected JSON shape from ${url}`);
-                            shapeError.retryable = true;
-                            throw shapeError;
-                        }
-
-                        return json;
-                    } catch (error) {
-                        if (!isTransientError(error) || attempt === apiMaxRetries) throw error;
-                        await delay(getRetryDelay(attempt));
-                    } finally {
-                        clearTimeout(timer);
-                    }
-                }
-
-                throw new Error(`Request retry limit reached for ${url}`);
-            };
-
-            const requireDataObject = (payload, endpointName) => {
-                if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
-                    throw new Error(`Invalid ${endpointName} response: missing data object`);
-                }
-
-                return payload;
-            };
-
-            const pdpPayload = requireDataObject(
-                await fetchJson(`/product-api/pdp-service/partNumber/${pagePartNumber}`),
-                'product',
-            );
-            const pageSize = Math.max(1, Math.min(50, pageResultsWanted));
-            const reviewPages = [];
-            let fetchedReviews = 0;
-            let totalResults = 0;
-            let reviewsSummary;
-
-            for (let pageIndex = 0; pageIndex < pageMaxPages && fetchedReviews < pageResultsWanted; pageIndex++) {
-                if (pageIndex > 0) {
-                    await delay(400 + Math.random() * 600);
-                }
-
-                const offset = pageIndex * pageSize;
-                const limit = Math.min(pageSize, pageResultsWanted - fetchedReviews);
-                const query = new URLSearchParams({
-                    Limit: String(limit),
-                    Offset: String(offset),
-                    Sort: pageSortBy,
-                    returnMeta: 'true',
+            try {
+                response = await client.fetch(url, {
+                    method: 'GET',
+                    headers: {
+                        referer,
+                        origin: API_BASE_URL,
+                    },
+                    redirect: 'follow',
+                    signal: controller.signal,
                 });
-
-                const response = requireDataObject(
-                    await fetchJson(
-                        `/product-api/bazaar-voice-reviews/partNumber/${pagePartNumber}?${query.toString()}`,
-                    ),
-                    'review',
-                );
-                const results = Array.isArray(response?.data?.Results) ? response.data.Results : [];
-
-                totalResults = Number(response?.data?.TotalResults || totalResults || 0);
-                reviewsSummary = response?.reviewsSummary || reviewsSummary;
-                reviewPages.push({
-                    pageNumber: pageIndex + 1,
-                    offset,
-                    limit,
-                    payload: response,
-                });
-
-                fetchedReviews += results.length;
-
-                if (!results.length || results.length < limit || (totalResults && fetchedReviews >= totalResults)) {
-                    break;
-                }
+            } finally {
+                clearTimeout(timer);
             }
 
-            return {
-                pdpPayload,
-                reviewPages,
-                totalResults,
-                reviewsSummary,
-            };
-        },
-        {
-            partNumber,
-            resultsWanted,
-            maxPages,
-            sortBy,
-            fetchTimeoutMs: FETCH_TIMEOUT_MS,
-            apiMaxRetries: API_MAX_RETRIES,
-            apiRetryBaseDelayMs: API_RETRY_BASE_DELAY_MS,
-        },
+            if (!response.ok) {
+                if (!isRetryableStatus(response.status) || attempt === API_MAX_RETRIES) {
+                    throw new Error(`Request failed ${response.status} for ${url}`);
+                }
+
+                await delay(getRetryDelay(attempt, response.headers.get('retry-after')));
+                continue;
+            }
+
+            let json;
+            try {
+                json = await response.json();
+            } catch {
+                const parseError = new Error(`Invalid JSON from ${url}`);
+                parseError.retryable = true;
+                throw parseError;
+            }
+
+            if (!json || typeof json !== 'object' || Array.isArray(json)) {
+                const shapeError = new Error(`Unexpected JSON shape from ${url}`);
+                shapeError.retryable = true;
+                throw shapeError;
+            }
+
+            return json;
+        } catch (error) {
+            if (!isTransientError(error) || attempt === API_MAX_RETRIES) throw error;
+            await delay(getRetryDelay(attempt));
+        }
+    }
+
+    throw new Error(`Request retry limit reached for ${url}`);
+}
+
+function requireDataObject(payload, endpointName) {
+    if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) {
+        throw new Error(`Invalid ${endpointName} response: missing data object`);
+    }
+
+    return payload;
+}
+
+async function fetchProductAndReviews(client, { partNumber, resultsWanted, maxPages, sortBy, productUrl }) {
+    const pdpPayload = requireDataObject(
+        await fetchApiJson(
+            client,
+            `${API_BASE_URL}/product-api/pdp-service/partNumber/${partNumber}`,
+            productUrl,
+        ),
+        'product',
     );
+    const pageSize = Math.max(1, Math.min(50, resultsWanted));
+    const reviewPages = [];
+    let fetchedReviews = 0;
+    let totalResults = 0;
+    let reviewsSummary;
+
+    for (let pageIndex = 0; pageIndex < maxPages && fetchedReviews < resultsWanted; pageIndex++) {
+        if (pageIndex > 0) {
+            await delay(400 + Math.random() * 600);
+        }
+
+        const offset = pageIndex * pageSize;
+        const limit = Math.min(pageSize, resultsWanted - fetchedReviews);
+        const query = new URLSearchParams({
+            Limit: String(limit),
+            Offset: String(offset),
+            Sort: sortBy,
+            returnMeta: 'true',
+        });
+        const response = requireDataObject(
+            await fetchApiJson(
+                client,
+                `${API_BASE_URL}/product-api/bazaar-voice-reviews/partNumber/${partNumber}?${query.toString()}`,
+                productUrl,
+            ),
+            'review',
+        );
+        const results = Array.isArray(response?.data?.Results) ? response.data.Results : [];
+
+        totalResults = Number(response?.data?.TotalResults || totalResults || 0);
+        reviewsSummary = response?.reviewsSummary || reviewsSummary;
+        reviewPages.push({
+            pageNumber: pageIndex + 1,
+            offset,
+            limit,
+            payload: response,
+        });
+
+        fetchedReviews += results.length;
+
+        if (!results.length || results.length < limit || (totalResults && fetchedReviews >= totalResults)) {
+            break;
+        }
+    }
+
+    return {
+        pdpPayload,
+        reviewPages,
+        totalResults,
+        reviewsSummary,
+    };
 }
 
 await Actor.init();
@@ -538,73 +498,33 @@ try {
 
     log.info(`Loaded ${dedupedProducts.length} product(s)`);
 
-    const viewport = pickRandom(VIEWPORTS);
+    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+    const client = new Impit({
+        browser: 'chrome',
+        ignoreTlsErrors: true,
+        ...(proxyUrl && { proxyUrl }),
+    });
 
-    const crawler = new PlaywrightCrawler({
-        proxyConfiguration,
-        maxConcurrency: 2,
-        maxRequestRetries: 3,
-        maxSessionRotations: 5,
-        navigationTimeoutSecs: 45,
-        requestHandlerTimeoutSecs: 120,
-        useSessionPool: true,
-        sessionPoolOptions: {
-            maxPoolSize: 10,
-            sessionOptions: {
-                maxUsageCount: 5,
-            },
-        },
-        launchContext: {
-            launcher: chromium,
-            useIncognitoPages: true,
-            launchOptions: {
-                headless: true,
-            },
-        },
-        preNavigationHooks: [
-            (_crawlingContext, gotoOptions) => {
-                // eslint-disable-next-line no-param-reassign
-                gotoOptions.waitUntil = 'domcontentloaded';
-            },
-        ],
-        async requestHandler({ page, request }) {
-            const { partNumber, requestedUrl, normalizedUrl } = request.userData;
-            log.info(`Processing product ${partNumber}`);
+    let nextProductIndex = 0;
+    const workerCount = Math.min(2, dedupedProducts.length);
+    const processProduct = async ({ partNumber, requestedUrl, normalizedUrl }) => {
+        log.info(`Processing product ${partNumber}`);
 
-            const BLOCKED_DOMAINS = ['google-analytics', 'googletagmanager', 'doubleclick', 'facebook', 'hotjar', 'adsystem', 'criteo', 'optimizely'];
-            await page.route(/\.(?:png|jpg|jpeg|gif|svg|webp|woff2?|ttf|eot|css|mp4|webm)(?:\?.*)?$/i, (route) => route.abort());
-            for (const domain of BLOCKED_DOMAINS) {
-                await page.route(`**/*${domain}*`, (route) => route.abort());
-            }
-
-            await page.waitForLoadState('domcontentloaded');
-
-            try {
-                await page.setViewportSize(viewport);
-            } catch {
-                // viewport already set
-            }
-
-            const bannerDismissed = await dismissCookieBanner(page);
-            if (bannerDismissed) {
-                await page.waitForTimeout(200 + Math.random() * 300);
-            }
-
-            const browserPayload = await fetchProductAndReviewsInBrowser(page, {
+        try {
+            const apiPayload = await fetchProductAndReviews(client, {
                 partNumber,
                 resultsWanted,
                 maxPages,
                 sortBy,
+                productUrl: normalizedUrl,
             });
-
             const productContext = buildProductContext({
                 requestedUrl,
                 partNumber,
-                pdpPayload: browserPayload.pdpPayload,
-                reviewsSummary: browserPayload.reviewsSummary,
+                pdpPayload: apiPayload.pdpPayload,
+                reviewsSummary: apiPayload.reviewsSummary,
             });
-
-            const mappedReviews = browserPayload.reviewPages.flatMap((pageResult) => {
+            const mappedReviews = apiPayload.reviewPages.flatMap((pageResult) => {
                 const payload = pageResult.payload?.data || {};
                 const includesProducts = payload?.Includes?.Products || {};
                 const reviews = Array.isArray(payload.Results) ? payload.Results : [];
@@ -621,32 +541,24 @@ try {
 
             await Dataset.pushData(mappedReviews);
             log.info(`Saved ${mappedReviews.length} reviews for ${partNumber}`);
-        },
-        failedRequestHandler(crawlingContext, error) {
-            const { request, session } = crawlingContext;
-            const message = error?.message || '';
-
-            if (/NS_ERROR_PROXY/i.test(message)) {
-                log.warning(`Proxy connection failed for ${request.url}, rotating session`);
-                session?.retire();
-                return;
-            }
-
-            const statusCode = message.match(/(\d{3})/)?.[1];
-            if (statusCode && ['403', '429', '503'].includes(statusCode)) {
-                log.warning(`Blocked (${statusCode}): ${request.url} - session may be blocked, will retry with new session`);
+        } catch (error) {
+            const message = error?.message || String(error);
+            const statusCode = message.match(/\b(403|429|5\d{2})\b/)?.[1];
+            if (statusCode) {
+                log.warning(`Request blocked or unavailable (${statusCode}) for ${normalizedUrl}: ${message}`);
             } else {
-                log.error(`Request failed for ${request.url}: ${message}`);
+                log.error(`Request failed for ${normalizedUrl}: ${message}`);
             }
-        },
-    });
+        }
+    };
 
-    await crawler.run(
-        dedupedProducts.map((item) => ({
-            url: item.normalizedUrl,
-            uniqueKey: item.partNumber,
-            userData: item,
-        })),
+    await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+            while (nextProductIndex < dedupedProducts.length) {
+                const product = dedupedProducts[nextProductIndex++];
+                await processProduct(product);
+            }
+        }),
     );
 } finally {
     await Actor.exit();
