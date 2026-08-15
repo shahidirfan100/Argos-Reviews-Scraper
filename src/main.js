@@ -11,7 +11,9 @@ const MAX_PRODUCTS = 50;
 const FETCH_TIMEOUT_MS = 15_000;
 const API_MAX_RETRIES = 3;
 const API_RETRY_BASE_DELAY_MS = 500;
+const MAX_PROXY_ROTATIONS = 2;
 const API_BASE_URL = 'https://www.argos.co.uk';
+const API_FALLBACK_BASE_URLS = ['https://m.argos.co.uk'];
 
 function toPositiveInteger(value, fallback) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -107,6 +109,25 @@ function normalizeProductUrl(partNumber) {
     return `https://www.argos.co.uk/product/${partNumber}`;
 }
 
+function normalizeProxyInput(proxyInput) {
+    if (!proxyInput || typeof proxyInput !== 'object') return undefined;
+
+    const options = { ...proxyInput };
+    const groups = Array.isArray(options.groups) && options.groups.length > 0
+        ? options.groups
+        : options.apifyProxyGroups || [];
+    const hasCustomProxyUrls = Array.isArray(options.proxyUrls) && options.proxyUrls.length > 0;
+    const hasApifyProxy = options.useApifyProxy !== false && !hasCustomProxyUrls;
+    const hasResidentialGroup = Array.isArray(groups) && groups.includes('RESIDENTIAL');
+    const hasCountry = options.countryCode || options.apifyProxyCountry;
+
+    if (hasApifyProxy && hasResidentialGroup && !hasCountry) {
+        options.countryCode = 'GB';
+    }
+
+    return options;
+}
+
 function normalizeSort(sortBy) {
     const value = String(sortBy || '')
         .trim()
@@ -159,75 +180,7 @@ async function loadInput() {
     return actorInput || {};
 }
 
-function getIncludedItem(pdpPayload, type, id) {
-    const included = Array.isArray(pdpPayload?.included) ? pdpPayload.included : [];
-    return included.find((item) => item.type === type && String(item.id) === String(id));
-}
-
-function getTaxonomyCategories(pdpPayload) {
-    const taxonomy = (Array.isArray(pdpPayload?.included) ? pdpPayload.included : []).find(
-        (item) => item.type === 'taxonomy',
-    );
-    const categories = taxonomy?.attributes?.categories;
-    if (!Array.isArray(categories)) return [];
-
-    return categories
-        .filter((item) => item?.browsePresentable)
-        .map((item) => ({
-            id: item.id,
-            type: item.type,
-            name: item.name,
-            url: item.url ? new URL(item.url, 'https://www.argos.co.uk').href : undefined,
-        }));
-}
-
-function buildProductContext({ requestedUrl, partNumber, pdpPayload, reviewsSummary }) {
-    const product = pdpPayload?.data;
-    const productAttributes = product?.attributes || {};
-    const priceAttributes = getIncludedItem(pdpPayload, 'prices', partNumber)?.attributes || {};
-    const reviewStatistics = getIncludedItem(pdpPayload, 'reviewstatistics', partNumber)?.attributes || {};
-    const mediaAttributes = getIncludedItem(pdpPayload, 'media', partNumber)?.attributes || {};
-    const energyAttributes = getIncludedItem(pdpPayload, 'energy', partNumber)?.attributes || {};
-    const variantAttributes = getIncludedItem(pdpPayload, 'variants', partNumber)?.attributes || {};
-
-    return pruneRecord({
-        requestedUrl,
-        productUrl: normalizeProductUrl(partNumber),
-        partNumber,
-        productName: productAttributes.name,
-        description: productAttributes.description,
-        brand: productAttributes.brand,
-        ean: productAttributes.ean,
-        sku: typeof productAttributes.sdf === 'string' ? productAttributes.sdf : undefined,
-        minimumDeliveryPrice: productAttributes.deliveryPrice,
-        deliveryEligible: productAttributes.deliverable,
-        collectionEligible: productAttributes.collectable,
-        maximumQuantity: productAttributes.maximumQuantity,
-        price: priceAttributes.now,
-        deliveryPrice: priceAttributes.delivery?.deliveryPrice,
-        freeDelivery: priceAttributes.delivery?.freeDelivery,
-        flashText: priceAttributes.flashText,
-        averageRating: reviewStatistics.avgRating,
-        reviewCount: reviewStatistics.reviewCount,
-        reviewsSummary,
-        categoryPath: getTaxonomyCategories(pdpPayload).map((item) => item.name),
-        categories: getTaxonomyCategories(pdpPayload),
-        imageUrls: Array.isArray(mediaAttributes.images) ? mediaAttributes.images : undefined,
-        videoUrls: Array.isArray(mediaAttributes.videos) ? mediaAttributes.videos : undefined,
-        pdfUrls: Array.isArray(mediaAttributes.pdfs) ? mediaAttributes.pdfs : undefined,
-        energyEfficiencyClass: energyAttributes.energyEfficiencyClass,
-        variants: Array.isArray(variantAttributes.variants)
-            ? variantAttributes.variants.map((variant) => ({
-                  partNumber: variant.partNumber,
-                  colour: variant.value,
-                  url: variant.url ? new URL(variant.url, 'https://www.argos.co.uk').href : undefined,
-              }))
-            : undefined,
-    });
-}
-
-function mapReview(review, includesProducts, productContext, pageNumber, sortBy) {
-    const reviewedProduct = includesProducts?.[review.ProductId] || {};
+function mapReview(review, sourceContext, pageNumber, sortBy) {
     const secondaryRatings = Object.values(review.SecondaryRatings || {}).reduce((acc, item) => {
         if (item?.Label && item?.Value !== undefined && item?.Value !== null) acc[item.Label] = item.Value;
         return acc;
@@ -245,7 +198,7 @@ function mapReview(review, includesProducts, productContext, pageNumber, sortBy)
         : undefined;
 
     return pruneRecord({
-        ...productContext,
+        ...sourceContext,
         sortBy,
         pageNumber,
         reviewId: Number.parseInt(review.Id, 10),
@@ -264,8 +217,6 @@ function mapReview(review, includesProducts, productContext, pageNumber, sortBy)
         isRatingsOnly: review.IsRatingsOnly,
         isSyndicated: review.IsSyndicated,
         syndication,
-        reviewProductId: review.ProductId,
-        reviewProductName: reviewedProduct.Name || review.OriginalProductName,
         reviewerName: review.UserNickname,
         reviewerLocation: review.UserLocation,
         reviewerContextAttributes: contextAttributes,
@@ -281,16 +232,6 @@ function mapReview(review, includesProducts, productContext, pageNumber, sortBy)
         pros: review.Pros,
         cons: review.Cons,
         additionalFields: review.AdditionalFields,
-        recommendedProducts: Array.isArray(review.ProductRecommendationIds)
-            ? review.ProductRecommendationIds.map((id) => {
-                  const product = includesProducts?.[id];
-                  return pruneRecord({
-                      id,
-                      name: product?.Name,
-                      averageRating: product?.ReviewStatistics?.AverageOverallRating,
-                  });
-              })
-            : undefined,
         clientResponses: Array.isArray(review.ClientResponses) ? review.ClientResponses : undefined,
     });
 }
@@ -304,7 +245,7 @@ function delay(ms) {
 function isTransientError(error) {
     return (
         error?.name === 'AbortError' ||
-        error?.code === 'ETIMEDOUT' ||
+        ['ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENETUNREACH', 'ETIMEDOUT'].includes(error?.code) ||
         error?.retryable === true ||
         /fetch|network|timeout|temporar|timed out/i.test(String(error?.message || error))
     );
@@ -320,7 +261,12 @@ function getRetryDelay(attempt, retryAfterHeader) {
 }
 
 function isRetryableStatus(status) {
-    return status === 403 || status === 429 || status >= 500;
+    return status === 403 || status === 408 || status === 429 || status >= 500;
+}
+
+function isFallbackStatus(error) {
+    const statusCode = error?.message?.match(/\b(403|404|408|429|5\d{2})\b/)?.[1];
+    return Boolean(statusCode) || isTransientError(error);
 }
 
 async function fetchApiJson(client, url, referer) {
@@ -334,11 +280,14 @@ async function fetchApiJson(client, url, referer) {
                 response = await client.fetch(url, {
                     method: 'GET',
                     headers: {
+                        accept: 'application/json',
+                        'accept-language': 'en-GB,en;q=0.9',
                         referer,
-                        origin: API_BASE_URL,
+                        origin: new URL(url).origin,
                     },
                     redirect: 'follow',
                     signal: controller.signal,
+                    timeout: FETCH_TIMEOUT_MS,
                 });
             } finally {
                 clearTimeout(timer);
@@ -386,20 +335,29 @@ function requireDataObject(payload, endpointName) {
     return payload;
 }
 
-async function fetchProductAndReviews(client, { partNumber, resultsWanted, maxPages, sortBy, productUrl }) {
-    const pdpPayload = requireDataObject(
-        await fetchApiJson(
-            client,
-            `${API_BASE_URL}/product-api/pdp-service/partNumber/${partNumber}`,
-            productUrl,
-        ),
-        'product',
-    );
+function requireReviewResults(payload) {
+    if (!Array.isArray(payload.data.Results)) {
+        throw new Error('Invalid review response: missing Results array');
+    }
+
+    return payload.data.Results;
+}
+
+function getHostProductUrl(productUrl, apiBaseUrl, partNumber) {
+    try {
+        const parsedProductUrl = new URL(productUrl);
+        const apiOrigin = new URL(apiBaseUrl).origin;
+        return `${apiOrigin}${parsedProductUrl.pathname}${parsedProductUrl.search}`;
+    } catch {
+        return `${apiBaseUrl}/product/${partNumber}`;
+    }
+}
+
+async function fetchProductAndReviewsFromHost(client, { apiBaseUrl, partNumber, resultsWanted, maxPages, sortBy, productUrl }) {
     const pageSize = Math.max(1, Math.min(50, resultsWanted));
     const reviewPages = [];
     let fetchedReviews = 0;
     let totalResults = 0;
-    let reviewsSummary;
 
     for (let pageIndex = 0; pageIndex < maxPages && fetchedReviews < resultsWanted; pageIndex++) {
         if (pageIndex > 0) {
@@ -417,15 +375,14 @@ async function fetchProductAndReviews(client, { partNumber, resultsWanted, maxPa
         const response = requireDataObject(
             await fetchApiJson(
                 client,
-                `${API_BASE_URL}/product-api/bazaar-voice-reviews/partNumber/${partNumber}?${query.toString()}`,
-                productUrl,
+                `${apiBaseUrl}/product-api/bazaar-voice-reviews/partNumber/${partNumber}?${query.toString()}`,
+                getHostProductUrl(productUrl, apiBaseUrl, partNumber),
             ),
             'review',
         );
-        const results = Array.isArray(response?.data?.Results) ? response.data.Results : [];
+        const results = requireReviewResults(response);
 
         totalResults = Number(response?.data?.TotalResults || totalResults || 0);
-        reviewsSummary = response?.reviewsSummary || reviewsSummary;
         reviewPages.push({
             pageNumber: pageIndex + 1,
             offset,
@@ -441,14 +398,35 @@ async function fetchProductAndReviews(client, { partNumber, resultsWanted, maxPa
     }
 
     return {
-        pdpPayload,
         reviewPages,
         totalResults,
-        reviewsSummary,
     };
 }
 
+async function fetchProductAndReviews(client, params) {
+    const apiBaseUrls = [API_BASE_URL, ...API_FALLBACK_BASE_URLS];
+    let lastError;
+
+    for (let index = 0; index < apiBaseUrls.length; index++) {
+        const apiBaseUrl = apiBaseUrls[index];
+
+        try {
+            return await fetchProductAndReviewsFromHost(client, { ...params, apiBaseUrl });
+        } catch (error) {
+            lastError = error;
+            const hasFallback = index < apiBaseUrls.length - 1;
+            if (!hasFallback || !isFallbackStatus(error)) throw error;
+
+            log.warning(`Reviews endpoint unavailable on ${apiBaseUrl}; trying the fallback API host`);
+        }
+    }
+
+    throw lastError;
+}
+
 await Actor.init();
+
+let exitCode = 0;
 
 try {
     const input = await loadInput();
@@ -493,61 +471,76 @@ try {
     const maxPages = toPositiveInteger(input.maxPages ?? input.max_pages, DEFAULT_MAX_PAGES);
     const sortBy = normalizeSort(input.sortBy ?? input.sort_by);
     const proxyConfiguration = input.proxyConfiguration
-        ? await Actor.createProxyConfiguration(input.proxyConfiguration)
+        ? await Actor.createProxyConfiguration(normalizeProxyInput(input.proxyConfiguration))
         : undefined;
 
     log.info(`Loaded ${dedupedProducts.length} product(s)`);
 
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-    const client = new Impit({
-        browser: 'chrome',
-        ignoreTlsErrors: true,
-        ...(proxyUrl && { proxyUrl }),
-    });
-
     let nextProductIndex = 0;
+    let savedRecords = 0;
     const workerCount = Math.min(2, dedupedProducts.length);
     const processProduct = async ({ partNumber, requestedUrl, normalizedUrl }) => {
         log.info(`Processing product ${partNumber}`);
 
-        try {
-            const apiPayload = await fetchProductAndReviews(client, {
-                partNumber,
-                resultsWanted,
-                maxPages,
-                sortBy,
-                productUrl: normalizedUrl,
-            });
-            const productContext = buildProductContext({
-                requestedUrl,
-                partNumber,
-                pdpPayload: apiPayload.pdpPayload,
-                reviewsSummary: apiPayload.reviewsSummary,
-            });
-            const mappedReviews = apiPayload.reviewPages.flatMap((pageResult) => {
-                const payload = pageResult.payload?.data || {};
-                const includesProducts = payload?.Includes?.Products || {};
-                const reviews = Array.isArray(payload.Results) ? payload.Results : [];
+        for (let proxyRotation = 0; proxyRotation <= MAX_PROXY_ROTATIONS; proxyRotation++) {
+            try {
+                const proxyUrl = proxyConfiguration
+                    ? await proxyConfiguration.newUrl(`argos_${partNumber}_${proxyRotation}`)
+                    : undefined;
+                const client = new Impit({
+                    browser: 'chrome',
+                    ignoreTlsErrors: true,
+                    ...(proxyUrl && { proxyUrl }),
+                });
+                const apiPayload = await fetchProductAndReviews(client, {
+                    partNumber,
+                    resultsWanted,
+                    maxPages,
+                    sortBy,
+                    productUrl: normalizedUrl,
+                });
+                const mappedReviews = apiPayload.reviewPages.flatMap((pageResult) => {
+                    const payload = pageResult.payload?.data || {};
+                    const reviews = Array.isArray(payload.Results) ? payload.Results : [];
 
-                return reviews.map((review) =>
-                    mapReview(review, includesProducts, productContext, pageResult.pageNumber, sortBy),
-                );
-            });
+                    return reviews.map((review) =>
+                        mapReview(
+                            review,
+                            { requestedUrl, productUrl: normalizedUrl, partNumber },
+                            pageResult.pageNumber,
+                            sortBy,
+                        ),
+                    );
+                });
 
-            if (!mappedReviews.length) {
-                log.warning(`No reviews found for ${normalizedUrl}`);
+                if (!mappedReviews.length) {
+                    log.warning(`No reviews found for ${normalizedUrl}`);
+                    return;
+                }
+
+                await Dataset.pushData(mappedReviews);
+                savedRecords += mappedReviews.length;
+                log.info(`Saved ${mappedReviews.length} reviews for ${partNumber}`);
                 return;
-            }
+            } catch (error) {
+                const message = error?.message || String(error);
+                const canRotateProxy =
+                    Boolean(proxyConfiguration) &&
+                    proxyRotation < MAX_PROXY_ROTATIONS &&
+                    isFallbackStatus(error);
 
-            await Dataset.pushData(mappedReviews);
-            log.info(`Saved ${mappedReviews.length} reviews for ${partNumber}`);
-        } catch (error) {
-            const message = error?.message || String(error);
-            const statusCode = message.match(/\b(403|429|5\d{2})\b/)?.[1];
-            if (statusCode) {
-                log.warning(`Request blocked or unavailable (${statusCode}) for ${normalizedUrl}: ${message}`);
-            } else {
-                log.error(`Request failed for ${normalizedUrl}: ${message}`);
+                if (canRotateProxy) {
+                    log.warning(`Proxy attempt ${proxyRotation + 1} was blocked or unavailable; rotating proxy session`);
+                    continue;
+                }
+
+                const statusCode = message.match(/\b(403|408|429|5\d{2})\b/)?.[1];
+                if (statusCode) {
+                    log.warning(`Request blocked or unavailable (${statusCode}) for ${normalizedUrl}: ${message}`);
+                } else {
+                    log.error(`Request failed for ${normalizedUrl}: ${message}`);
+                }
+                return;
             }
         }
     };
@@ -560,6 +553,12 @@ try {
             }
         }),
     );
+    if (savedRecords === 0) {
+        log.warning('Run completed without dataset records');
+    }
+} catch (error) {
+    exitCode = 1;
+    log.error(`Actor run failed: ${error?.message || String(error)}`);
 } finally {
-    await Actor.exit();
+    await Actor.exit({ exitCode });
 }

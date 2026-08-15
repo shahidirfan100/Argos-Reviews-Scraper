@@ -1,13 +1,13 @@
 ## What does Argos Reviews Scraper do?
 
-Argos Reviews Scraper collects public customer reviews from Argos product pages. Enter an Argos product ID or product URL, choose the review limit and sort order, and receive one structured dataset record per review with product details, ratings, reviewer information, and feedback metrics.
+Argos Reviews Scraper collects public customer reviews from Argos product pages. Enter an Argos product ID or product URL, choose the review limit and sort order, and receive one structured dataset record per review with ratings, reviewer information, and feedback metrics.
 
 The dataset is useful for product research, competitor analysis, voice-of-customer work, review monitoring, catalog enrichment, and sentiment workflows. Results can be downloaded from Apify or connected to other tools through datasets, webhooks, integrations, and the Apify API.
 
 ## Why use Argos Reviews Scraper?
 
 - **Review-focused data** - Collect review titles, full text, ratings, recommendations, helpful votes, secondary ratings, photos, videos, and client responses when Argos publishes them.
-- **Product context** - Attach product name, brand, price, categories, aggregate rating, review count, media, delivery information, and variants to each review.
+- **Review-only output** - Keep product enrichment out of the dataset while retaining the requested URL, canonical URL, and part number as source identifiers.
 - **Flexible collection** - Use a product ID or a full Argos URL, including URLs with query strings or tracking parameters.
 - **Controlled volume** - Set a review limit and a page cap to balance collection depth and run time.
 - **Repeatable monitoring** - Schedule recurring runs to track new reviews, rating changes, and changes in customer feedback.
@@ -15,22 +15,13 @@ The dataset is useful for product research, competitor analysis, voice-of-custom
 
 ## What data can you extract from Argos reviews?
 
-Each saved item represents one customer review enriched with product information. Optional fields appear only when Argos provides a value.
+Each saved item represents one customer review. The requested URL, canonical URL, and part number identify the source product without adding product catalog information to every review record. Optional review fields appear only when Argos provides a value.
 
 | Field | Type | Description |
 |---|---|---|
 | `partNumber` | String | Argos product identifier. |
 | `requestedUrl` | String | Product value supplied in the run input. |
 | `productUrl` | String | Canonical Argos product URL. |
-| `productName` | String | Product name. |
-| `description` | String | Product description when available. |
-| `brand` | String | Product brand. |
-| `ean`, `sku` | String | Product identifiers when available. |
-| `price` | Number | Current product price when available. |
-| `averageRating`, `reviewCount` | Number | Product-level review statistics. |
-| `categoryPath`, `categories` | Array, Object | Product taxonomy and category details. |
-| `imageUrls`, `videoUrls`, `pdfUrls` | Array | Product media links. |
-| `variants` | Array | Related product variants and their URLs. |
 | `sortBy`, `pageNumber` | String, Integer | Sort mode and review page number. |
 | `reviewId`, `submissionId` | Integer, String | Review identifiers. |
 | `submittedAt`, `lastModifiedAt`, `lastModeratedAt` | String | Review timestamps. |
@@ -43,7 +34,7 @@ Each saved item represents one customer review enriched with product information
 | `helpfulVotes`, `unhelpfulVotes`, `totalFeedbackCount` | Integer | Feedback vote counts. |
 | `photos`, `videos` | Array | Review media links or metadata. |
 | `pros`, `cons`, `additionalFields` | String, Object | Additional review content when available. |
-| `recommendedProducts`, `clientResponses` | Array | Related product recommendations and brand responses. |
+| `clientResponses` | Array | Public responses attached to the review. |
 
 ## How to use Argos Reviews Scraper
 
@@ -123,12 +114,6 @@ The following example shows one review record. Optional fields are omitted when 
   "requestedUrl": "https://www.argos.co.uk/product/7953538",
   "productUrl": "https://www.argos.co.uk/product/7953538",
   "partNumber": "7953538",
-  "productName": "Example Argos product",
-  "brand": "Example brand",
-  "price": 29.99,
-  "averageRating": 4.5,
-  "reviewCount": 128,
-  "categoryPath": ["Home", "Kitchen"],
   "sortBy": "newest",
   "pageNumber": 1,
   "reviewId": 182006575,
@@ -152,7 +137,6 @@ The following example shows one review record. Optional fields are omitted when 
 - Reviews are returned in the selected source order until `resultsWanted` or `maxPages` is reached.
 - A product with no available reviews produces a warning and no dataset item for that product.
 - Fields are omitted when the source does not publish them. Missing optional fields do not indicate a failed run.
-- Product variants may share review records. Use `reviewProductId` and `reviewProductName` when variant-level analysis matters.
 - Temporary network failures, timeouts, rate limits, and server errors are retried with bounded backoff.
 - Public product pages and review data can change. Recheck scheduled datasets when source fields or review totals change.
 - The Actor accepts product pages, not Argos category pages or search pages.
@@ -162,7 +146,7 @@ The following example shows one review record. Optional fields are omitted when 
 - Start with `resultsWanted: 20` and `maxPages: 2` to confirm the product and output shape.
 - Use a canonical product URL or a 7 to 8 digit product ID.
 - Increase `maxPages` when a product has a large review history.
-- Use `reviewCount` and `averageRating` for product-level comparisons, and `text`, `pros`, `cons`, and `secondaryRatings` for review analysis.
+- Use `text`, `pros`, `cons`, ratings, and `secondaryRatings` for review analysis.
 - Schedule repeat runs when you need to monitor new feedback or rating changes.
 
 ## Integrations and export formats

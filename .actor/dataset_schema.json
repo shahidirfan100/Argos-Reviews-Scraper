@@ -6,7 +6,6 @@
             "transformation": {
                 "fields": [
                     "partNumber",
-                    "productName",
                     "reviewId",
                     "submittedAt",
                     "overallRating",
@@ -21,10 +20,6 @@
                 "properties": {
                     "partNumber": {
                         "label": "Product ID",
-                        "format": "text"
-                    },
-                    "productName": {
-                        "label": "Product",
                         "format": "text"
                     },
                     "reviewId": {
