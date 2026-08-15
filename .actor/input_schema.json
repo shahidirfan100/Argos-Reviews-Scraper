@@ -1,0 +1,62 @@
+{
+    "title": "Argos Reviews Scraper",
+    "description": "Collect customer reviews from Argos product pages.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "productUrl": {
+            "title": "Product URL",
+            "type": "string",
+            "description": "Optional Argos product URL. Clean and messy URLs are both accepted as long as they contain the product ID.",
+            "editor": "textfield",
+            "prefill": "https://www.argos.co.uk/product/7953538?clickPR=plp:1:2"
+        },
+        "productId": {
+            "title": "Product ID",
+            "type": "string",
+            "description": "Optional Argos product ID. Use this if you already know the product part number.",
+            "editor": "textfield",
+            "prefill": "7953538"
+        },
+        "resultsWanted": {
+            "title": "Results wanted per product",
+            "type": "integer",
+            "description": "Maximum number of reviews to collect for each product URL.",
+            "minimum": 1,
+            "default": 20,
+            "prefill": 20,
+            "editor": "number"
+        },
+        "maxPages": {
+            "title": "Maximum pages per product",
+            "type": "integer",
+            "description": "Safety cap for review pages per product.",
+            "minimum": 1,
+            "default": 2,
+            "prefill": 2,
+            "editor": "number"
+        },
+        "sortBy": {
+            "title": "Sort reviews by",
+            "type": "string",
+            "description": "Choose how reviews should be sorted.",
+            "default": "newest",
+            "prefill": "newest",
+            "enum": ["newest", "oldest", "highest_rating", "lowest_rating"],
+            "enumTitles": ["Newest", "Oldest", "Highest rating", "Lowest rating"],
+            "editor": "select"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Optional proxy settings. Enable Apify Proxy if your account setup requires it.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": [],
+    "additionalProperties": false
+}

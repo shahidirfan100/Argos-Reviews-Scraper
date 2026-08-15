@@ -1,0 +1,62 @@
+{
+    "actorSpecification": 1,
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "partNumber",
+                    "productName",
+                    "reviewId",
+                    "submittedAt",
+                    "overallRating",
+                    "recommended",
+                    "reviewerName",
+                    "title",
+                    "productUrl"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "partNumber": {
+                        "label": "Product ID",
+                        "format": "text"
+                    },
+                    "productName": {
+                        "label": "Product",
+                        "format": "text"
+                    },
+                    "reviewId": {
+                        "label": "Review ID",
+                        "format": "number"
+                    },
+                    "submittedAt": {
+                        "label": "Submitted",
+                        "format": "text"
+                    },
+                    "overallRating": {
+                        "label": "Rating",
+                        "format": "number"
+                    },
+                    "recommended": {
+                        "label": "Recommended",
+                        "format": "boolean"
+                    },
+                    "reviewerName": {
+                        "label": "Reviewer",
+                        "format": "text"
+                    },
+                    "title": {
+                        "label": "Review Title",
+                        "format": "text"
+                    },
+                    "productUrl": {
+                        "label": "Product URL",
+                        "format": "link"
+                    }
+                }
+            }
+        }
+    }
+}
