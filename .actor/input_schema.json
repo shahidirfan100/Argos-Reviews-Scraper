@@ -49,12 +49,11 @@
         "proxyConfiguration": {
             "title": "Proxy configuration",
             "type": "object",
-            "description": "Optional proxy settings. Enable Apify Proxy if your account setup requires it.",
+            "description": "Optional proxy settings. Supports Apify Proxy groups/country routing or custom HTTP/HTTPS proxy URLs. Argos may reject some cloud proxy ranges even when they are UK-based.",
             "editor": "proxy",
             "default": {
                 "useApifyProxy": true,
-                "apifyProxyGroups": ["RESIDENTIAL"],
-                "countryCode": "GB"
+                "apifyProxyGroups": ["RESIDENTIAL"]
             }
         }
     },

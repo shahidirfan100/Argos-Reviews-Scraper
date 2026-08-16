@@ -17,24 +17,24 @@ The dataset is useful for product research, competitor analysis, voice-of-custom
 
 Each saved item represents one customer review. The requested URL, canonical URL, and part number identify the source product without adding product catalog information to every review record. Optional review fields appear only when Argos provides a value.
 
-| Field | Type | Description |
-|---|---|---|
-| `partNumber` | String | Argos product identifier. |
-| `requestedUrl` | String | Product value supplied in the run input. |
-| `productUrl` | String | Canonical Argos product URL. |
-| `sortBy`, `pageNumber` | String, Integer | Sort mode and review page number. |
-| `reviewId`, `submissionId` | Integer, String | Review identifiers. |
-| `submittedAt`, `lastModifiedAt`, `lastModeratedAt` | String | Review timestamps. |
-| `title`, `text` | String | Review headline and full review text. |
-| `overallRating`, `ratingRange` | Number | Review score and available score range. |
-| `recommended`, `isFeatured`, `isRatingsOnly`, `isSyndicated` | Boolean | Review status and recommendation flags. |
-| `reviewerName`, `reviewerLocation` | String | Public reviewer information when available. |
-| `reviewerContextAttributes` | Object | Reviewer context values supplied by Argos. |
-| `secondaryRatings` | Object | Category-level scores such as quality or ease of use. |
-| `helpfulVotes`, `unhelpfulVotes`, `totalFeedbackCount` | Integer | Feedback vote counts. |
-| `photos`, `videos` | Array | Review media links or metadata. |
-| `pros`, `cons`, `additionalFields` | String, Object | Additional review content when available. |
-| `clientResponses` | Array | Public responses attached to the review. |
+| Field                                                        | Type            | Description                                           |
+| ------------------------------------------------------------ | --------------- | ----------------------------------------------------- |
+| `partNumber`                                                 | String          | Argos product identifier.                             |
+| `requestedUrl`                                               | String          | Product value supplied in the run input.              |
+| `productUrl`                                                 | String          | Canonical Argos product URL.                          |
+| `sortBy`, `pageNumber`                                       | String, Integer | Sort mode and review page number.                     |
+| `reviewId`, `submissionId`                                   | Integer, String | Review identifiers.                                   |
+| `submittedAt`, `lastModifiedAt`, `lastModeratedAt`           | String          | Review timestamps.                                    |
+| `title`, `text`                                              | String          | Review headline and full review text.                 |
+| `overallRating`, `ratingRange`                               | Number          | Review score and available score range.               |
+| `recommended`, `isFeatured`, `isRatingsOnly`, `isSyndicated` | Boolean         | Review status and recommendation flags.               |
+| `reviewerName`, `reviewerLocation`                           | String          | Public reviewer information when available.           |
+| `reviewerContextAttributes`                                  | Object          | Reviewer context values supplied by Argos.            |
+| `secondaryRatings`                                           | Object          | Category-level scores such as quality or ease of use. |
+| `helpfulVotes`, `unhelpfulVotes`, `totalFeedbackCount`       | Integer         | Feedback vote counts.                                 |
+| `photos`, `videos`                                           | Array           | Review media links or metadata.                       |
+| `pros`, `cons`, `additionalFields`                           | String, Object  | Additional review content when available.             |
+| `clientResponses`                                            | Array           | Public responses attached to the review.              |
 
 ## How to use Argos Reviews Scraper
 
@@ -49,14 +49,14 @@ At least one valid product ID or product URL is required. If several inputs are 
 
 ## Input Parameters
 
-| Parameter | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `productId` | String | No* | Example ID: `7953538` | Argos product part number containing 7 or 8 digits. |
-| `productUrl` | String | No* | Example Argos URL | Argos product page URL. Query strings, tracking parameters, and trailing slashes are accepted. |
-| `resultsWanted` | Integer | No | `20` | Maximum reviews to collect per product. Minimum is `1`. |
-| `maxPages` | Integer | No | `2` | Maximum review pages to request per product. Minimum is `1`. |
-| `sortBy` | String | No | `newest` | One of `newest`, `oldest`, `highest_rating`, or `lowest_rating`. |
-| `proxyConfiguration` | Object | No | Apify Proxy configuration | Optional proxy settings for the run. |
+| Parameter            | Type    | Required | Default                   | Description                                                                                    |
+| -------------------- | ------- | -------- | ------------------------- | ---------------------------------------------------------------------------------------------- |
+| `productId`          | String  | No*      | Example ID: `7953538`     | Argos product part number containing 7 or 8 digits.                                            |
+| `productUrl`         | String  | No*      | Example Argos URL         | Argos product page URL. Query strings, tracking parameters, and trailing slashes are accepted. |
+| `resultsWanted`      | Integer | No       | `20`                      | Maximum reviews to collect per product. Minimum is `1`.                                        |
+| `maxPages`           | Integer | No       | `2`                       | Maximum review pages to request per product. Minimum is `1`.                                   |
+| `sortBy`             | String  | No       | `newest`                  | One of `newest`, `oldest`, `highest_rating`, or `lowest_rating`.                               |
+| `proxyConfiguration` | Object  | No       | Apify Proxy configuration | Optional proxy settings for the run.                                                           |
 
 `*` Provide at least one of `productId` or `productUrl` for a successful run. If both are supplied for the same product, the duplicate is removed.
 
@@ -68,10 +68,10 @@ Use a complete Argos product URL for a straightforward review collection.
 
 ```json
 {
-  "productUrl": "https://www.argos.co.uk/product/7953538",
-  "resultsWanted": 20,
-  "maxPages": 2,
-  "sortBy": "newest"
+    "productUrl": "https://www.argos.co.uk/product/7953538",
+    "resultsWanted": 20,
+    "maxPages": 2,
+    "sortBy": "newest"
 }
 ```
 
@@ -81,29 +81,44 @@ Use the product ID when you already have an Argos product list.
 
 ```json
 {
-  "productId": "7953538",
-  "resultsWanted": 50,
-  "maxPages": 5,
-  "sortBy": "highest_rating"
+    "productId": "7953538",
+    "resultsWanted": 50,
+    "maxPages": 5,
+    "sortBy": "highest_rating"
 }
 ```
 
-### Use proxy routing for a larger run
+### Use proxy routing
 
-Enable Apify Proxy when your run needs proxy routing or additional access reliability.
+The Actor accepts Apify Proxy settings, including group and country routing. A UK exit IP is not a guarantee that Argos will accept the provider's IP range.
 
 ```json
 {
-  "productUrl": "https://www.argos.co.uk/product/7953538?clickPR=plp:1:2",
-  "resultsWanted": 100,
-  "maxPages": 10,
-  "sortBy": "oldest",
-  "proxyConfiguration": {
-    "useApifyProxy": true,
-    "apifyProxyGroups": ["RESIDENTIAL"]
-  }
+    "productUrl": "https://www.argos.co.uk/product/7953538?clickPR=plp:1:2",
+    "resultsWanted": 100,
+    "maxPages": 10,
+    "sortBy": "oldest",
+    "proxyConfiguration": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"],
+        "countryCode": "GB"
+    }
 }
 ```
+
+You can instead supply a custom HTTP/HTTPS proxy through the proxy editor's `proxyUrls` field. Custom proxy URLs are passed to Impit but are never written to the Actor log.
+
+```json
+{
+    "productId": "9973200",
+    "proxyConfiguration": {
+        "useApifyProxy": false,
+        "proxyUrls": ["http://username:password@proxy.example:8000"]
+    }
+}
+```
+
+If every configured session receives `403` from both verified Argos hosts, the Actor reports that network egress is blocked and fails the run when no records were saved. A product with a successful API response and zero reviews is reported separately as a verified empty-review result.
 
 ## Sample Output
 
@@ -111,24 +126,24 @@ The following example shows one review record. Optional fields are omitted when 
 
 ```json
 {
-  "requestedUrl": "https://www.argos.co.uk/product/7953538",
-  "productUrl": "https://www.argos.co.uk/product/7953538",
-  "partNumber": "7953538",
-  "sortBy": "newest",
-  "pageNumber": 1,
-  "reviewId": 182006575,
-  "submittedAt": "2026-06-01T04:52:43.000+00:00",
-  "title": "Good product",
-  "text": "The product works well and is easy to use.",
-  "overallRating": 5,
-  "ratingRange": 5,
-  "recommended": true,
-  "reviewerName": "Customer",
-  "helpfulVotes": 3,
-  "unhelpfulVotes": 0,
-  "secondaryRatings": {
-    "Ease of use": 5
-  }
+    "requestedUrl": "https://www.argos.co.uk/product/7953538",
+    "productUrl": "https://www.argos.co.uk/product/7953538",
+    "partNumber": "7953538",
+    "sortBy": "newest",
+    "pageNumber": 1,
+    "reviewId": 182006575,
+    "submittedAt": "2026-06-01T04:52:43.000+00:00",
+    "title": "Good product",
+    "text": "The product works well and is easy to use.",
+    "overallRating": 5,
+    "ratingRange": 5,
+    "recommended": true,
+    "reviewerName": "Customer",
+    "helpfulVotes": 3,
+    "unhelpfulVotes": 0,
+    "secondaryRatings": {
+        "Ease of use": 5
+    }
 }
 ```
 
@@ -178,7 +193,7 @@ Optional fields are omitted when Argos does not publish a value for a product or
 
 ### Do I need Apify Proxy?
 
-No. Proxy configuration is optional, but it can help when a run needs proxy routing or additional access reliability.
+No. Proxy configuration is optional. Argos currently rejects some cloud proxy ranges, including UK-addressed ranges, so use an external HTTP/HTTPS proxy with known-good Argos access if the Actor reports blocked network egress. A dedicated Cloudflare Gateway/WARP-based proxy egress is one option.
 
 ### Can I schedule repeat collections?
 

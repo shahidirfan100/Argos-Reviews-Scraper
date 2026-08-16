@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
@@ -14,6 +15,24 @@ const API_RETRY_BASE_DELAY_MS = 500;
 const MAX_PROXY_ROTATIONS = 2;
 const API_BASE_URL = 'https://www.argos.co.uk';
 const API_FALLBACK_BASE_URLS = ['https://m.argos.co.uk'];
+
+class HttpStatusError extends Error {
+    constructor(status, endpointHost) {
+        super(`Argos endpoint returned HTTP ${status}`);
+        this.name = 'HttpStatusError';
+        this.status = status;
+        this.endpointHost = endpointHost;
+    }
+}
+
+export class NetworkEgressBlockedError extends Error {
+    constructor(hosts, proxyConfigured) {
+        super('Argos rejected every verified endpoint from the configured network egress');
+        this.name = 'NetworkEgressBlockedError';
+        this.hosts = hosts;
+        this.proxyConfigured = proxyConfigured;
+    }
+}
 
 function toPositiveInteger(value, fallback) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -54,7 +73,7 @@ function parseProductUrlsInput(value) {
     return [];
 }
 
-function collectInputProducts(input) {
+export function collectInputProducts(input) {
     return unique(
         [
             ...parseProductUrlsInput(input.products),
@@ -70,7 +89,7 @@ function collectInputProducts(input) {
     );
 }
 
-function extractPartNumber(inputValue) {
+export function extractPartNumber(inputValue) {
     const candidate = String(inputValue || '').trim();
     if (!candidate) return null;
 
@@ -109,21 +128,56 @@ function normalizeProductUrl(partNumber) {
     return `https://www.argos.co.uk/product/${partNumber}`;
 }
 
-function normalizeProxyInput(proxyInput) {
+export function parseProductInputs(productInputs) {
+    const parsedProducts = unique(productInputs)
+        .map((requestedInput) => {
+            const partNumber = extractPartNumber(requestedInput);
+            if (!partNumber) return null;
+            return {
+                requestedUrl: requestedInput,
+                partNumber,
+                normalizedUrl: normalizeProductUrl(partNumber),
+            };
+        })
+        .filter(Boolean);
+
+    return {
+        products: parsedProducts.filter(
+            (item, index, collection) =>
+                collection.findIndex((entry) => entry.partNumber === item.partNumber) === index,
+        ),
+        invalidInputs: productInputs.filter((requestedInput) => !extractPartNumber(requestedInput)),
+    };
+}
+
+export function normalizeProxyInput(proxyInput) {
     if (!proxyInput || typeof proxyInput !== 'object') return undefined;
 
     const options = { ...proxyInput };
-    const groups = Array.isArray(options.groups) && options.groups.length > 0
-        ? options.groups
-        : options.apifyProxyGroups || [];
-    const hasCustomProxyUrls = Array.isArray(options.proxyUrls) && options.proxyUrls.length > 0;
-    const hasApifyProxy = options.useApifyProxy !== false && !hasCustomProxyUrls;
-    const hasResidentialGroup = Array.isArray(groups) && groups.includes('RESIDENTIAL');
-    const hasCountry = options.countryCode || options.apifyProxyCountry;
+    const proxyUrls = Array.isArray(options.proxyUrls)
+        ? options.proxyUrls.filter((proxyUrl) => typeof proxyUrl === 'string' && proxyUrl.trim())
+        : [];
 
-    if (hasApifyProxy && hasResidentialGroup && !hasCountry) {
-        options.countryCode = 'GB';
+    if (proxyUrls.length) {
+        // Custom proxies cannot be combined with Apify Proxy groups or geolocation.
+        return {
+            useApifyProxy: false,
+            proxyUrls,
+        };
     }
+
+    if (options.useApifyProxy === false) return { useApifyProxy: false };
+
+    const groups =
+        Array.isArray(options.groups) && options.groups.length > 0 ? options.groups : options.apifyProxyGroups || [];
+    const countryCode = options.countryCode || options.apifyProxyCountry;
+
+    delete options.apifyProxyGroups;
+    delete options.apifyProxyCountry;
+    delete options.proxyUrls;
+    options.groups = groups;
+    if (countryCode) options.countryCode = countryCode;
+    if (groups.includes('RESIDENTIAL') && !countryCode) options.countryCode = 'GB';
 
     return options;
 }
@@ -261,15 +315,18 @@ function getRetryDelay(attempt, retryAfterHeader) {
 }
 
 function isRetryableStatus(status) {
-    return status === 403 || status === 408 || status === 429 || status >= 500;
+    // A 403 is an egress/fingerprint rejection, not a transient response worth
+    // retrying repeatedly through the same proxy session.
+    return status === 408 || status === 429 || status >= 500;
 }
 
 function isFallbackStatus(error) {
-    const statusCode = error?.message?.match(/\b(403|404|408|429|5\d{2})\b/)?.[1];
-    return Boolean(statusCode) || isTransientError(error);
+    return [403, 404, 408, 429].includes(error?.status) || error?.status >= 500 || isTransientError(error);
 }
 
-async function fetchApiJson(client, url, referer) {
+async function fetchApiJson(client, url, referer, diagnostics) {
+    const endpointHost = new URL(url).hostname;
+
     for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt++) {
         try {
             const controller = new AbortController();
@@ -294,8 +351,11 @@ async function fetchApiJson(client, url, referer) {
             }
 
             if (!response.ok) {
+                log.warning(
+                    `Request diagnostic | host=${endpointHost} | status=${response.status} | retry=${attempt} | proxy=${diagnostics.proxyConfigured} | new_session=${diagnostics.newProxySession && attempt === 0}`,
+                );
                 if (!isRetryableStatus(response.status) || attempt === API_MAX_RETRIES) {
-                    throw new Error(`Request failed ${response.status} for ${url}`);
+                    throw new HttpStatusError(response.status, endpointHost);
                 }
 
                 await delay(getRetryDelay(attempt, response.headers.get('retry-after')));
@@ -306,13 +366,13 @@ async function fetchApiJson(client, url, referer) {
             try {
                 json = await response.json();
             } catch {
-                const parseError = new Error(`Invalid JSON from ${url}`);
+                const parseError = new Error('Argos endpoint returned invalid JSON');
                 parseError.retryable = true;
                 throw parseError;
             }
 
             if (!json || typeof json !== 'object' || Array.isArray(json)) {
-                const shapeError = new Error(`Unexpected JSON shape from ${url}`);
+                const shapeError = new Error('Argos endpoint returned an unexpected JSON shape');
                 shapeError.retryable = true;
                 throw shapeError;
             }
@@ -324,7 +384,7 @@ async function fetchApiJson(client, url, referer) {
         }
     }
 
-    throw new Error(`Request retry limit reached for ${url}`);
+    throw new Error('Argos request retry limit reached');
 }
 
 function requireDataObject(payload, endpointName) {
@@ -353,7 +413,10 @@ function getHostProductUrl(productUrl, apiBaseUrl, partNumber) {
     }
 }
 
-async function fetchProductAndReviewsFromHost(client, { apiBaseUrl, partNumber, resultsWanted, maxPages, sortBy, productUrl }) {
+async function fetchProductAndReviewsFromHost(
+    client,
+    { apiBaseUrl, partNumber, resultsWanted, maxPages, sortBy, productUrl, diagnostics },
+) {
     const pageSize = Math.max(1, Math.min(50, resultsWanted));
     const reviewPages = [];
     let fetchedReviews = 0;
@@ -377,6 +440,10 @@ async function fetchProductAndReviewsFromHost(client, { apiBaseUrl, partNumber, 
                 client,
                 `${apiBaseUrl}/product-api/bazaar-voice-reviews/partNumber/${partNumber}?${query.toString()}`,
                 getHostProductUrl(productUrl, apiBaseUrl, partNumber),
+                {
+                    ...diagnostics,
+                    newProxySession: diagnostics.newProxySession && pageIndex === 0,
+                },
             ),
             'review',
         );
@@ -403,162 +470,209 @@ async function fetchProductAndReviewsFromHost(client, { apiBaseUrl, partNumber, 
     };
 }
 
-async function fetchProductAndReviews(client, params) {
+export async function fetchProductAndReviews(client, params) {
     const apiBaseUrls = [API_BASE_URL, ...API_FALLBACK_BASE_URLS];
     let lastError;
+    const hostErrors = [];
 
     for (let index = 0; index < apiBaseUrls.length; index++) {
         const apiBaseUrl = apiBaseUrls[index];
 
         try {
-            return await fetchProductAndReviewsFromHost(client, { ...params, apiBaseUrl });
+            return await fetchProductAndReviewsFromHost(client, {
+                ...params,
+                apiBaseUrl,
+                diagnostics: {
+                    ...params.diagnostics,
+                    newProxySession: params.diagnostics.newProxySession && index === 0,
+                },
+            });
         } catch (error) {
             lastError = error;
+            hostErrors.push({ host: new URL(apiBaseUrl).hostname, status: error?.status });
             const hasFallback = index < apiBaseUrls.length - 1;
-            if (!hasFallback || !isFallbackStatus(error)) throw error;
+            if (!hasFallback) break;
+            if (!isFallbackStatus(error)) throw error;
 
-            log.warning(`Reviews endpoint unavailable on ${apiBaseUrl}; trying the fallback API host`);
+            log.warning(
+                `Endpoint fallback | host=${new URL(apiBaseUrl).hostname} | status=${error?.status || 'unavailable'} | proxy=${params.diagnostics.proxyConfigured}`,
+            );
         }
+    }
+
+    if (hostErrors.length === apiBaseUrls.length && hostErrors.every(({ status }) => status === 403)) {
+        throw new NetworkEgressBlockedError(
+            hostErrors.map(({ host }) => host),
+            params.diagnostics.proxyConfigured,
+        );
     }
 
     throw lastError;
 }
 
-await Actor.init();
+export async function runActor() {
+    await Actor.init();
 
-let exitCode = 0;
+    try {
+        const input = await loadInput();
+        const productInputs = collectInputProducts(input);
 
-try {
-    const input = await loadInput();
-    const productInputs = collectInputProducts(input);
-
-    if (!productInputs.length) {
-        throw new Error(
-            'Missing input. Provide a `productId` or `productUrl`.',
-        );
-    }
-
-    const parsedProducts = unique(productInputs)
-        .map((requestedInput) => {
-            const partNumber = extractPartNumber(requestedInput);
-            if (!partNumber) return null;
-            return {
-                requestedUrl: requestedInput,
-                partNumber,
-                normalizedUrl: normalizeProductUrl(partNumber),
-            };
-        })
-        .filter(Boolean);
-    const dedupedProducts = parsedProducts.filter(
-        (item, index, collection) => collection.findIndex((entry) => entry.partNumber === item.partNumber) === index,
-    );
-
-    if (!dedupedProducts.length) {
-        throw new Error('No valid Argos product IDs or product URLs were found in the input.');
-    }
-
-    if (dedupedProducts.length > MAX_PRODUCTS) {
-        log.warning(`Input contains ${dedupedProducts.length} products, capping to ${MAX_PRODUCTS}`);
-        dedupedProducts.length = MAX_PRODUCTS;
-    }
-
-    const invalidInputs = productInputs.filter((requestedInput) => !extractPartNumber(requestedInput));
-    for (const invalidInput of invalidInputs) {
-        log.warning(`Skipping invalid product input: ${invalidInput}`);
-    }
-
-    const resultsWanted = toPositiveInteger(input.resultsWanted ?? input.results_wanted, DEFAULT_RESULTS_WANTED);
-    const maxPages = toPositiveInteger(input.maxPages ?? input.max_pages, DEFAULT_MAX_PAGES);
-    const sortBy = normalizeSort(input.sortBy ?? input.sort_by);
-    const proxyConfiguration = input.proxyConfiguration
-        ? await Actor.createProxyConfiguration(normalizeProxyInput(input.proxyConfiguration))
-        : undefined;
-
-    log.info(`Loaded ${dedupedProducts.length} product(s)`);
-
-    let nextProductIndex = 0;
-    let savedRecords = 0;
-    const workerCount = Math.min(2, dedupedProducts.length);
-    const processProduct = async ({ partNumber, requestedUrl, normalizedUrl }) => {
-        log.info(`Processing product ${partNumber}`);
-
-        for (let proxyRotation = 0; proxyRotation <= MAX_PROXY_ROTATIONS; proxyRotation++) {
-            try {
-                const proxyUrl = proxyConfiguration
-                    ? await proxyConfiguration.newUrl(`argos_${partNumber}_${proxyRotation}`)
-                    : undefined;
-                const client = new Impit({
-                    browser: 'chrome',
-                    ignoreTlsErrors: true,
-                    ...(proxyUrl && { proxyUrl }),
-                });
-                const apiPayload = await fetchProductAndReviews(client, {
-                    partNumber,
-                    resultsWanted,
-                    maxPages,
-                    sortBy,
-                    productUrl: normalizedUrl,
-                });
-                const mappedReviews = apiPayload.reviewPages.flatMap((pageResult) => {
-                    const payload = pageResult.payload?.data || {};
-                    const reviews = Array.isArray(payload.Results) ? payload.Results : [];
-
-                    return reviews.map((review) =>
-                        mapReview(
-                            review,
-                            { requestedUrl, productUrl: normalizedUrl, partNumber },
-                            pageResult.pageNumber,
-                            sortBy,
-                        ),
-                    );
-                });
-
-                if (!mappedReviews.length) {
-                    log.warning(`No reviews found for ${normalizedUrl}`);
-                    return;
-                }
-
-                await Dataset.pushData(mappedReviews);
-                savedRecords += mappedReviews.length;
-                log.info(`Saved ${mappedReviews.length} reviews for ${partNumber}`);
-                return;
-            } catch (error) {
-                const message = error?.message || String(error);
-                const canRotateProxy =
-                    Boolean(proxyConfiguration) &&
-                    proxyRotation < MAX_PROXY_ROTATIONS &&
-                    isFallbackStatus(error);
-
-                if (canRotateProxy) {
-                    log.warning(`Proxy attempt ${proxyRotation + 1} was blocked or unavailable; rotating proxy session`);
-                    continue;
-                }
-
-                const statusCode = message.match(/\b(403|408|429|5\d{2})\b/)?.[1];
-                if (statusCode) {
-                    log.warning(`Request blocked or unavailable (${statusCode}) for ${normalizedUrl}: ${message}`);
-                } else {
-                    log.error(`Request failed for ${normalizedUrl}: ${message}`);
-                }
-                return;
-            }
+        if (!productInputs.length) {
+            throw new Error('Missing input. Provide a `productId` or `productUrl`.');
         }
-    };
 
-    await Promise.all(
-        Array.from({ length: workerCount }, async () => {
-            while (nextProductIndex < dedupedProducts.length) {
-                const product = dedupedProducts[nextProductIndex++];
-                await processProduct(product);
+        const { products: dedupedProducts, invalidInputs } = parseProductInputs(productInputs);
+
+        if (!dedupedProducts.length) {
+            throw new Error('No valid Argos product IDs or product URLs were found in the input.');
+        }
+
+        if (dedupedProducts.length > MAX_PRODUCTS) {
+            log.warning(`Input contains ${dedupedProducts.length} products, capping to ${MAX_PRODUCTS}`);
+            dedupedProducts.length = MAX_PRODUCTS;
+        }
+
+        for (const invalidInput of invalidInputs) {
+            log.warning(`Skipping invalid product input: ${invalidInput}`);
+        }
+
+        const resultsWanted = toPositiveInteger(input.resultsWanted ?? input.results_wanted, DEFAULT_RESULTS_WANTED);
+        const maxPages = toPositiveInteger(input.maxPages ?? input.max_pages, DEFAULT_MAX_PAGES);
+        const sortBy = normalizeSort(input.sortBy ?? input.sort_by);
+        const proxyOptions = normalizeProxyInput(input.proxyConfiguration);
+
+        log.info(`Loaded ${dedupedProducts.length} product(s)`);
+
+        let nextProductIndex = 0;
+        let savedRecords = 0;
+        const outcomes = [];
+        const workerCount = Math.min(2, dedupedProducts.length);
+        const processProduct = async ({ partNumber, requestedUrl, normalizedUrl }) => {
+            log.info(`Processing product ${partNumber}`);
+            let proxyConfiguration;
+
+            try {
+                proxyConfiguration = proxyOptions ? await Actor.createProxyConfiguration(proxyOptions) : undefined;
+            } catch (error) {
+                log.error(
+                    `Proxy setup failed | product=${partNumber} | proxy=${Boolean(proxyOptions)} | reason=${error?.name || 'Error'}`,
+                );
+                return { kind: 'failed', partNumber };
             }
-        }),
-    );
-    if (savedRecords === 0) {
-        log.warning('Run completed without dataset records');
+
+            for (let proxyRotation = 0; proxyRotation <= MAX_PROXY_ROTATIONS; proxyRotation++) {
+                try {
+                    const newProxySession = Boolean(proxyConfiguration);
+                    const proxyUrl = proxyConfiguration
+                        ? await proxyConfiguration.newUrl(`argos_${partNumber}_${proxyRotation}`)
+                        : undefined;
+                    const client = new Impit({
+                        browser: 'chrome',
+                        ignoreTlsErrors: true,
+                        ...(proxyUrl && { proxyUrl }),
+                    });
+                    const apiPayload = await fetchProductAndReviews(client, {
+                        partNumber,
+                        resultsWanted,
+                        maxPages,
+                        sortBy,
+                        productUrl: normalizedUrl,
+                        diagnostics: {
+                            proxyConfigured: Boolean(proxyUrl),
+                            newProxySession,
+                        },
+                    });
+                    const mappedReviews = apiPayload.reviewPages.flatMap((pageResult) => {
+                        const payload = pageResult.payload?.data || {};
+                        const reviews = Array.isArray(payload.Results) ? payload.Results : [];
+
+                        return reviews.map((review) =>
+                            mapReview(
+                                review,
+                                { requestedUrl, productUrl: normalizedUrl, partNumber },
+                                pageResult.pageNumber,
+                                sortBy,
+                            ),
+                        );
+                    });
+
+                    if (!mappedReviews.length) {
+                        log.warning(
+                            `Successful empty-review result | product=${partNumber} | proxy=${Boolean(proxyUrl)}`,
+                        );
+                        return { kind: 'empty', partNumber };
+                    }
+
+                    await Dataset.pushData(mappedReviews);
+                    savedRecords += mappedReviews.length;
+                    log.info(`Saved ${mappedReviews.length} reviews for ${partNumber}`);
+                    return { kind: 'saved', partNumber, count: mappedReviews.length };
+                } catch (error) {
+                    const isBlockedEgress = error instanceof NetworkEgressBlockedError;
+                    const canRotateProxy =
+                        Boolean(proxyConfiguration) &&
+                        proxyRotation < MAX_PROXY_ROTATIONS &&
+                        (isBlockedEgress || isFallbackStatus(error));
+
+                    if (canRotateProxy) {
+                        log.warning(
+                            `Proxy rotation | attempt=${proxyRotation + 1} | status=${isBlockedEgress ? 403 : error?.status || 'unavailable'} | proxy=true | new_session=true`,
+                        );
+                        continue;
+                    }
+
+                    if (isBlockedEgress) {
+                        log.warning(
+                            `Network egress blocked | hosts=${error.hosts.join(',')} | status=403 | proxy=${error.proxyConfigured} | sessions=${proxyConfiguration ? proxyRotation + 1 : 0}`,
+                        );
+                        return { kind: 'blocked', partNumber };
+                    }
+
+                    log.error(
+                        `Product request failed | product=${partNumber} | status=${error?.status || 'unavailable'} | proxy=${Boolean(proxyConfiguration)} | reason=${error?.name || 'Error'}`,
+                    );
+                    return { kind: 'failed', partNumber };
+                }
+            }
+
+            return { kind: 'failed', partNumber };
+        };
+
+        await Promise.all(
+            Array.from({ length: workerCount }, async () => {
+                while (nextProductIndex < dedupedProducts.length) {
+                    const product = dedupedProducts[nextProductIndex++];
+                    outcomes.push(await processProduct(product));
+                }
+            }),
+        );
+
+        const blockedProducts = outcomes.filter(({ kind }) => kind === 'blocked').length;
+        const failedProducts = outcomes.filter(({ kind }) => kind === 'failed').length;
+        const emptyProducts = outcomes.filter(({ kind }) => kind === 'empty').length;
+
+        if (savedRecords === 0) {
+            if (blockedProducts || failedProducts) {
+                throw new Error(
+                    `No records were saved: blocked=${blockedProducts}, failed=${failedProducts}, empty=${emptyProducts}. The run is not a successful data run.`,
+                );
+            }
+
+            log.warning(
+                `Run completed with a verified empty-review result | products=${emptyProducts} | saved=0 | requests_succeeded=true`,
+            );
+        } else {
+            log.info(
+                `Run completed | saved=${savedRecords} | blocked=${blockedProducts} | failed=${failedProducts} | empty=${emptyProducts}`,
+            );
+        }
+
+        await Actor.exit();
+    } catch (error) {
+        log.error(`Actor run failed: ${error?.message || String(error)}`);
+        await Actor.exit({ exitCode: 1 });
     }
-} catch (error) {
-    exitCode = 1;
-    log.error(`Actor run failed: ${error?.message || String(error)}`);
-} finally {
-    await Actor.exit({ exitCode });
 }
+
+const isExecutedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isExecutedDirectly) await runActor();
